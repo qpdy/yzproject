@@ -41,6 +41,8 @@ React 的一次完整渲染可拆分为 5 个阶段，类组件/函数组件的�
 
 为什么不可中断？——DOM 写操作是真实世界的副作用，一旦中断会导致界面状态不一致（部分节点已更新、部分未更新）。
 
+> 例外：React 18 的 **Selective Hydration（选择性水合）** 本身属于 commit 阶段，但它**可以被用户交互打断并重排优先级**（用户点了哪块就优先水合哪块）。因此严格说，commit 中的**常规 DOM mutation 不可中断**，而 **hydration 可按交互优先级选择性插入**——这是唯一的例外（见 补-7）。
+
 - commit 阶段的入口函数是 `commitRoot`。**React 18 起不再使用 effect list**，而是遍历整棵 Fiber 树，通过节点的 `flags` / `subtreeFlags` 判断该节点（及其子树）是否有副作用需要处理，没有副作用的子树会被跳过
 - commit 阶段会一次性、不可中断地把所有变更应用到真实 DOM 上
 - 内部又分为三个子阶段（Before Mutation → Mutation → Layout），每个子阶段都会遍历一次 Fiber 树，但整体是同步的：
@@ -50,7 +52,7 @@ React 的一次完整渲染可拆分为 5 个阶段，类组件/函数组件的�
 
 **5. 被动副作用执行（Passive Effects）**
 
-- useEffect 的**调度**在 commit 阶段完成后才发起（scheduleCallback，经 scheduler 以宏任务排队），**真正执行**发生在浏览器 Paint 之后（异步）
+- useEffect 的**调度**在 commit 阶段完成后才发起（scheduleCallback，经 scheduler 以宏任务排队），**真正执行**发生在浏览器 Paint 之后（异步）。严格说，“paint 之后执行”是设计意图与绝大多数情况下的行为——本质是 passive effect 通过宏任务**异步调度、不阻塞 paint**；若期间发生同步 flush（如 `flushSync` 触发了下一次渲染），passive effect 也可能在 paint 之前被清空，因此它不是 100% 严格保证“paint 之后才执行”。
 - 在下一次渲染的 `useEffect` 回调执行之前，会先执行上一次的清理函数（清除订阅、定时器等），再执行本次 `useEffect` 回调（两者都在 paint 之后异步执行，只是顺序上清理函数先于本次回调）；组件卸载时也会执行清理函数
 
 > 副作用主要指 `useEffect`、类组件的 `componentDidMount` / `componentDidUpdate` 等。
@@ -263,7 +265,7 @@ const ref = useRef();
 **单节点 diff vs 多节点 diff**：
 - **单节点**：新节点只有一个，比较 type 和 key，匹配则复用（打 Update），不匹配则新建并删除旧的。
 - **多节点**（列表）diff 分两轮遍历：
-  1. **第一轮**：从左到右逐个对比新旧，key 相同则复用更新；遇到 key 不匹配立即停止。若第一轮走完时**新节点已耗尽**（旧节点还有剩余），直接把剩余旧节点标记删除。
+  1. **第一轮**：从左到右逐个对比新旧，**key 和 type 都匹配才复用更新**；一旦某位置不匹配（key 不同，或同 key 但 type 变化）立即停止并记录该位置，转入第二轮。若第一轮走完时**新节点已耗尽**（旧节点还有剩余），直接把剩余旧节点标记删除。
   2. **第二轮**：处理第一轮未消费的部分——把旧节点剩余项按 key 建成 Map，遍历新节点剩余项：能在 Map 找到则复用并删除映射，**找不到则新建（标记 Placement 插入）**；若**旧节点先耗尽而新节点仍有剩余**，这部分剩余新节点同样标记 Placement 插入。最后 Map 里没被消费的旧节点全部删除。
   3. **移动判断**：复用节点时维护 `lastPlacedIndex`（上次复用节点在旧列表中的最大下标），若当前节点的旧下标 `< lastPlacedIndex` 说明它需要移动，否则更新 `lastPlacedIndex`。
 
@@ -279,7 +281,7 @@ const ref = useRef();
 | this | 无 this，靠闭包 | 用 this.state / this.props |
 | 状态 | useState / useReducer | this.state + setState |
 | 生命周期 | useEffect 等 Hooks 模拟 | componentDidMount 等 |
-| 性能 | 无实例，开销小 | 有实例开销（this、生命周期绑定），实例仅在挂载时创建一次 |
+| 性能 | 无实例、更轻量；但每次渲染重建闭包 | 有实例开销（this、生命周期绑定），实例仅在挂载时创建一次 |
 | 逻辑复用 | 自定义 Hook（推荐） | HOC / Render Props |
 | 存在感 | React 18+ 主流 | 官方仍支持，新代码用函数组件 |
 
@@ -293,7 +295,7 @@ const ref = useRef();
 
 ## P0-10. useEffect 的执行时机、依赖数组、cleanup、如何避免死循环？
 
-**执行时机**：在浏览器绘制**之后**异步执行（passive effect），不会阻塞 paint。
+**执行时机**：在浏览器绘制**之后**异步执行（passive effect），不会阻塞 paint。本质是通过 `scheduleCallback` 以宏任务**异步调度**，“paint 之后执行”是绝大多数情况下的行为而非 100% 严格保证（同步 flush 等场景可能在 paint 前被清空）。
 
 **依赖数组**：
 - `useEffect(fn)`：每次渲染后都执行。
@@ -504,7 +506,7 @@ const MemoChild = React.memo(Child);
 
 | | useLayoutEffect | useEffect |
 |---|---|---|
-| 执行时机 | Commit 之后、浏览器 paint **之前**（同步） | paint **之后**（异步） |
+| 执行时机 | Commit 之后、浏览器 paint **之前**（同步） | paint **之后**（异步，绝大多数情况，非严格保证） |
 | 是否会阻塞视觉 | 会（同步执行，可读取布局） | 不阻塞 |
 | 用途 | 读取/修改 DOM 布局、避免闪烁 | 数据请求、订阅、大部分副作用 |
 
@@ -1193,7 +1195,7 @@ useEffect(() => {
 ## P3-扩展-10. 如何做错误监控和性能监控？
 
 - **错误监控**：`window.onerror` / `unhandledrejection` + React ErrorBoundary 上报；Source Map 还原。
-- **性能监控**：`Performance API`（FCP/LCP/CLS/FID）、`web-vitals` 库、长任务监控。
+- **性能监控**：`Performance API`（FCP/LCP/CLS/INP 等）、`web-vitals` 库、长任务监控。注意：Core Web Vitals 自 2024 年 3 月起用 **INP（Interaction to Next Paint）** 取代了已废弃的 FID（First Input Delay）——INP 衡量整个页面生命周期内所有交互的响应速度，比 FID（只测首次输入延迟）更全面。
 - 上报到监控平台（Sentry / 自建），区分环境、采样上报。
 
 ## P3-扩展-11. 如何定位线上 React 报错？
